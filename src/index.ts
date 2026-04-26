@@ -1,71 +1,372 @@
 import { DurableObject } from "cloudflare:workers";
 
-/**
- * Welcome to Cloudflare Workers! This is your first Durable Objects application.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your Durable Object in action
- * - Run `npm run deploy` to publish your application
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/durable-objects
- */
+type Facing = "up" | "down" | "left" | "right";
+type PlayerAnimMode = "idle" | "walk" | "attack" | "death";
 
-/** A Durable Object's behavior is defined in an exported Javascript class */
-export class MyDurableObject extends DurableObject<Env> {
-	/**
-	 * The constructor is invoked once upon creation of the Durable Object, i.e. the first call to
-	 * 	`DurableObjectStub::get` for a given identifier (no-op constructors can be omitted)
-	 *
-	 * @param ctx - The interface for interacting with Durable Object state
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 */
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
+type PlayerRealtimeState = {
+  userId: string;
+  username: string;
+  tile: { x: number; y: number };
+  renderPosition: { x: number; y: number };
+  facing: Facing;
+  mode: PlayerAnimMode;
+  dead: boolean;
+  hp: number;
+  maxHp: number;
+  level: number;
+  pvpEnabled: boolean;
+  mapLevelId: number;
+  animationStartedAt: number;
+  updatedAt: number;
+};
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(): Promise<string> {
-		let result = this.ctx.storage.sql
-			.exec("SELECT 'Hello, World!' as greeting")
-			.one() as { greeting: string };
-		return result.greeting;
-	}
+type SessionAttachment = {
+  sessionId: string;
+  roomId: string;
+  player?: PlayerRealtimeState;
+};
+
+type ClientStateMessage = {
+  type: "hello" | "state";
+  player: PlayerRealtimeState;
+};
+
+type ClientPingMessage = {
+  type: "ping";
+};
+
+type ClientMessage = ClientStateMessage | ClientPingMessage;
+
+type SnapshotMessage = {
+  type: "snapshot";
+  roomId: string;
+  serverNow: number;
+  players: PlayerRealtimeState[];
+};
+
+type ErrorMessage = {
+  type: "error";
+  code: string;
+  message: string;
+};
+
+type Env = {
+  REALTIME_ROOM: DurableObjectNamespace<RealtimeRoom>;
+};
+
+const JSON_HEADERS = {
+  "Content-Type": "application/json; charset=utf-8",
+  "Cache-Control": "no-store",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+};
+
+function json(data: unknown, init?: ResponseInit) {
+  return new Response(JSON.stringify(data, null, 2), {
+    ...init,
+    headers: {
+      ...JSON_HEADERS,
+      ...(init?.headers ?? {}),
+    },
+  });
+}
+
+function parseRoomId(url: URL) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  if (parts.length < 3 || parts[0] !== "room") {
+    return null;
+  }
+  return parts[1] || null;
+}
+
+function parseRouteKind(url: URL) {
+  const parts = url.pathname.split("/").filter(Boolean);
+  return parts[2] || "";
+}
+
+function toFacing(value: unknown): Facing {
+  return value === "up" || value === "down" || value === "left" || value === "right" ? value : "down";
+}
+
+function toMode(value: unknown): PlayerAnimMode {
+  return value === "walk" || value === "attack" || value === "death" ? value : "idle";
+}
+
+function toFiniteNumber(value: unknown, fallback = 0) {
+  const next = Number(value);
+  return Number.isFinite(next) ? next : fallback;
+}
+
+function normalizePlayerState(value: unknown): PlayerRealtimeState | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const root = value as Record<string, unknown>;
+  const userId = typeof root.userId === "string" ? root.userId.trim() : "";
+  const username = typeof root.username === "string" ? root.username.trim() : "";
+  if (!userId || !username) {
+    return null;
+  }
+  const tileValue = root.tile as Record<string, unknown> | undefined;
+  const renderValue = root.renderPosition as Record<string, unknown> | undefined;
+  const now = Date.now();
+  return {
+    userId,
+    username,
+    tile: {
+      x: Math.floor(toFiniteNumber(tileValue?.x, 0)),
+      y: Math.floor(toFiniteNumber(tileValue?.y, 0)),
+    },
+    renderPosition: {
+      x: toFiniteNumber(renderValue?.x, toFiniteNumber(tileValue?.x, 0)),
+      y: toFiniteNumber(renderValue?.y, toFiniteNumber(tileValue?.y, 0)),
+    },
+    facing: toFacing(root.facing),
+    mode: toMode(root.mode),
+    dead: Boolean(root.dead),
+    hp: Math.max(0, Math.floor(toFiniteNumber(root.hp, 0))),
+    maxHp: Math.max(1, Math.floor(toFiniteNumber(root.maxHp, 1))),
+    level: Math.max(1, Math.floor(toFiniteNumber(root.level, 1))),
+    pvpEnabled: Boolean(root.pvpEnabled),
+    mapLevelId: Math.floor(toFiniteNumber(root.mapLevelId, -1)),
+    animationStartedAt: Math.max(0, Math.floor(toFiniteNumber(root.animationStartedAt, now))),
+    updatedAt: Math.max(0, Math.floor(toFiniteNumber(root.updatedAt, now))),
+  };
+}
+
+function safeSend(ws: WebSocket, payload: SnapshotMessage | ErrorMessage) {
+  try {
+    ws.send(JSON.stringify(payload));
+  } catch {
+    try {
+      ws.close(1011, "send failed");
+    } catch {
+      // no-op
+    }
+  }
 }
 
 export default {
-	/**
-	 * This is the standard fetch handler for a Cloudflare Worker
-	 *
-	 * @param request - The request submitted to the Worker from the client
-	 * @param env - The interface to reference bindings declared in wrangler.jsonc
-	 * @param ctx - The execution context of the Worker
-	 * @returns The response to be sent back to the client
-	 */
-	async fetch(request, env, ctx): Promise<Response> {
-		// Create a `DurableObjectId` for an instance of the `MyDurableObject`
-		// class. The name of class is used to identify the Durable Object.
-		// Requests from all Workers to the instance named
-		// will go to a single globally unique Durable Object instance.
-		const id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(
-			new URL(request.url).pathname,
-		);
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
 
-		// Create a stub to open a communication channel with the Durable
-		// Object instance.
-		const stub = env.MY_DURABLE_OBJECT.get(id);
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: JSON_HEADERS,
+      });
+    }
 
-		// Call the `sayHello()` RPC method on the stub to invoke the method on
-		// the remote Durable Object instance
-		const greeting = await stub.sayHello();
+    if (url.pathname === "/health") {
+      return json({
+        ok: true,
+        service: "bqtoroblox-realtime",
+        transport: "durable-objects-websocket",
+        now: Date.now(),
+      });
+    }
 
-		return new Response(greeting);
-	},
+    const roomId = parseRoomId(url);
+    if (!roomId) {
+      return json(
+        {
+          ok: false,
+          message: "Use /room/<roomId>/websocket or /room/<roomId>/debug",
+        },
+        { status: 404 },
+      );
+    }
+
+    const routeKind = parseRouteKind(url);
+    if (routeKind !== "websocket" && routeKind !== "debug") {
+      return json({ ok: false, message: "Unknown route." }, { status: 404 });
+    }
+
+    if (routeKind === "websocket") {
+      const upgradeHeader = request.headers.get("Upgrade");
+      if (request.method !== "GET") {
+        return json({ ok: false, message: "Expected GET." }, { status: 405 });
+      }
+      if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+        return json({ ok: false, message: "Expected Upgrade: websocket." }, { status: 426 });
+      }
+    }
+
+    const stub = env.REALTIME_ROOM.getByName(roomId);
+    return stub.fetch(request);
+  },
 } satisfies ExportedHandler<Env>;
+
+export class RealtimeRoom extends DurableObject {
+  private sessions: Map<WebSocket, SessionAttachment>;
+  private playersByUserId: Map<string, PlayerRealtimeState>;
+  private roomId: string | null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sessions = new Map();
+    this.playersByUserId = new Map();
+    this.roomId = null;
+
+    this.ctx.getWebSockets().forEach((ws) => {
+      const attachment = ws.deserializeAttachment() as SessionAttachment | null;
+      if (!attachment) {
+        return;
+      }
+      this.roomId = this.roomId ?? attachment.roomId;
+      this.sessions.set(ws, attachment);
+      if (attachment.player) {
+        this.playersByUserId.set(attachment.player.userId, attachment.player);
+      }
+    });
+
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const roomId = parseRoomId(url);
+    const routeKind = parseRouteKind(url);
+
+    if (!roomId) {
+      return json({ ok: false, message: "Missing room id." }, { status: 400 });
+    }
+    this.roomId = this.roomId ?? roomId;
+
+    if (routeKind === "debug") {
+      return json(this.snapshot());
+    }
+
+    if (routeKind !== "websocket") {
+      return json({ ok: false, message: "Unknown room route." }, { status: 404 });
+    }
+
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
+
+    this.ctx.acceptWebSocket(server);
+
+    const attachment: SessionAttachment = {
+      sessionId: crypto.randomUUID(),
+      roomId,
+    };
+    server.serializeAttachment(attachment);
+    this.sessions.set(server, attachment);
+
+    safeSend(server, {
+      type: "snapshot",
+      roomId,
+      serverNow: Date.now(),
+      players: [...this.playersByUserId.values()],
+    });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+    let payload: ClientMessage | null = null;
+    try {
+      payload = JSON.parse(raw) as ClientMessage;
+    } catch {
+      safeSend(ws, {
+        type: "error",
+        code: "bad_json",
+        message: "Invalid realtime message payload.",
+      });
+      return;
+    }
+
+    if (!payload || typeof payload !== "object" || !("type" in payload)) {
+      safeSend(ws, {
+        type: "error",
+        code: "bad_message",
+        message: "Missing message type.",
+      });
+      return;
+    }
+
+    if (payload.type === "ping") {
+      safeSend(ws, {
+        type: "snapshot",
+        roomId: this.roomId ?? "unknown",
+        serverNow: Date.now(),
+        players: [...this.playersByUserId.values()],
+      });
+      return;
+    }
+
+    const player = normalizePlayerState(payload.player);
+    if (!player) {
+      safeSend(ws, {
+        type: "error",
+        code: "bad_player_state",
+        message: "Missing or invalid player payload.",
+      });
+      return;
+    }
+
+    const attachment = (this.sessions.get(ws) ?? ws.deserializeAttachment() ?? {
+      sessionId: crypto.randomUUID(),
+      roomId: this.roomId ?? "unknown",
+    }) as SessionAttachment;
+    attachment.player = player;
+    attachment.roomId = this.roomId ?? attachment.roomId;
+    this.sessions.set(ws, attachment);
+    ws.serializeAttachment(attachment);
+    this.playersByUserId.set(player.userId, player);
+
+    this.broadcastSnapshot();
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
+    const attachment = (this.sessions.get(ws) ?? ws.deserializeAttachment() ?? null) as SessionAttachment | null;
+    this.sessions.delete(ws);
+    try {
+      ws.close(code, reason);
+    } catch {
+      // no-op
+    }
+
+    if (attachment?.player?.userId) {
+      const stillConnected = [...this.sessions.values()].some(
+        (session) => session.player?.userId === attachment.player?.userId,
+      );
+      if (!stillConnected) {
+        this.playersByUserId.delete(attachment.player.userId);
+      }
+    }
+
+    this.broadcastSnapshot();
+  }
+
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.webSocketClose(ws, 1011, "websocket error", false);
+  }
+
+  private snapshot() {
+    return {
+      ok: true,
+      roomId: this.roomId,
+      connections: this.sessions.size,
+      players: [...this.playersByUserId.values()],
+      serverNow: Date.now(),
+    };
+  }
+
+  private broadcastSnapshot() {
+    const payload: SnapshotMessage = {
+      type: "snapshot",
+      roomId: this.roomId ?? "unknown",
+      serverNow: Date.now(),
+      players: [...this.playersByUserId.values()],
+    };
+    for (const ws of this.sessions.keys()) {
+      safeSend(ws, payload);
+    }
+  }
+}
